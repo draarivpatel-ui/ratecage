@@ -1,4 +1,4 @@
-name: ci
+name: CI
 
 on:
   push:
@@ -6,8 +6,7 @@ on:
   pull_request:
     branches: [main]
 
-permissions:
-  contents: read
+permissions: read-all
 
 jobs:
   test:
@@ -18,13 +17,47 @@ jobs:
       matrix:
         os: [ubuntu-24.04, windows-latest]
         node: [18, 20, 22, 24]
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
         with:
           node-version: ${{ matrix.node }}
-      - run: npm test
-      - run: node scripts/build-cjs.mjs --check
-      - run: npm run smoke
-      - run: node bin/ratecage.mjs --version
-      - run: npm pack --dry-run
+      - name: Install development dependencies
+        shell: bash
+        run: npm ci
+      - name: Run deterministic test suite
+        shell: bash
+        run: npm test
+      - name: Verify generated CommonJS build is current
+        shell: bash
+        run: node scripts/build-cjs.mjs --check
+      - name: Run smoke test
+        shell: bash
+        run: npm run smoke
+      - name: Verify CLI version
+        shell: bash
+        run: node bin/ratecage.mjs --version
+      - name: Verify package tarball contents
+        shell: bash
+        run: npm pack --dry-run
+
+  fuzz:
+    name: property fuzz
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
+        with:
+          node-version: 22
+      - name: Install development dependencies
+        shell: bash
+        run: npm ci
+      - name: Run deterministic property-based fuzz tests
+        shell: bash
+        run: npm run test:fuzz

@@ -1,24 +1,25 @@
-# Security policy
+# Security Policy
 
 ## Supported versions
 
-The initial supported release line is `1.x`.
+| Version | Supported |
+| --- | --- |
+| 1.x | Yes |
+| < 1.0 | No |
 
 ## Reporting a vulnerability
 
-Please do not open a public issue for a security vulnerability. Use the GitHub private vulnerability reporting flow for this repository when it is available. If private reporting is not available, open a minimal public issue that asks for a private contact channel and do not include exploit details, secrets, real traffic, or personal data.
+Use the private GitHub Security Advisories form: [Report a vulnerability](https://github.com/draarivpatel-ui/ratecage/security/advisories/new). Do not open a public issue, pull request, or discussion with exploit details, secrets, private endpoints, or personal data.
 
-Include:
+Include the affected version, operating system, Node.js version, a minimal reproduction, the security impact, and whether the issue involves IP spoofing, memory growth, algorithm correctness, header handling, the CLI, or store failure behavior.
 
-- the affected version
-- the operating system and Node.js version
-- a minimal reproduction
-- the security impact
-- whether the issue involves IP spoofing, memory growth, algorithm correctness, header handling, the CLI, or store failure behavior
+## Disclosure timeline
+
+We acknowledge reports within 48 hours. We aim to confirm or reject the report within 7 days, prepare a fix as soon as practical, and coordinate public disclosure with the reporter. Unless a shorter deadline is required by an actively exploited issue, please allow up to 90 days for a coordinated fix and disclosure.
 
 ## Scope
 
-Security-relevant behavior includes:
+In scope:
 
 - incorrect trust decisions for `X-Forwarded-For` or `Forwarded`
 - acceptance of malformed or obfuscated IP forms that should be rejected
@@ -29,6 +30,14 @@ Security-relevant behavior includes:
 - algorithm behavior that consumes less cost than requested
 - CLI file handling that follows unsafe file types or leaks terminal control sequences
 
-## Operational guidance
+## Out of scope
 
-Keep `trustedProxies` narrow and exact. Use the default fail-closed store policy unless a documented availability review explicitly accepts fail-open behavior. Treat rate limiting as one layer of defense, not as a replacement for authentication, authorization, TLS, or upstream network protection.
+Attacks that require write access to the victim process, host, or trusted proxy configuration are out of scope. Rate limiting is one layer of defense and does not replace authentication, authorization, TLS, or upstream network protection.
+
+## Hardening notes
+
+The package has zero runtime dependencies. Input budgets, fail-closed validation, deterministic tests, and property-based fuzz tests are part of the maintenance bar. A report that the library marks unsafe must block the operation in the caller; audit output is a boundary signal, not proof that a downstream system is safe.
+
+## Disclosure history
+
+No published advisories yet. Fixed versions will be listed here with their advisory links.

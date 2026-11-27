@@ -27,9 +27,10 @@ test('package has the required name version and license', () => {
   assert.equal(packageJson.license, 'MIT');
 });
 
-test('package has zero runtime and development dependencies', () => {
+test('package has zero runtime dependencies and only the pinned fuzz development dependency', () => {
   assert.deepEqual(packageJson.dependencies, {});
-  assert.deepEqual(packageJson.devDependencies, {});
+  assert.deepEqual(Object.keys(packageJson.devDependencies), ['fast-check']);
+  assert.match(packageJson.devDependencies['fast-check'], /^\d+\.\d+\.\d+$/);
 });
 
 test('package supports Node.js 18 and newer', () => {
@@ -67,8 +68,10 @@ test('package test command enumerates tests through the Windows-safe runner', ()
   assert.equal(packageJson.scripts.test, 'node scripts/run-tests.mjs');
 });
 
-test('repository contains no node_modules directory', () => {
-  assert.equal(fs.existsSync(path.join(root, 'node_modules')), false);
+test('repository lockfile supports reproducible development installs', () => {
+  const lock = JSON.parse(fs.readFileSync(path.join(root, 'package-lock.json'), 'utf8'));
+  assert.equal(lock.packages[''].dependencies, undefined);
+  assert.deepEqual(Object.keys(lock.packages[''].devDependencies), ['fast-check']);
 });
 
 test('required community and documentation files exist', () => {

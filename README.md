@@ -1,5 +1,7 @@
 # ratecage
 
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/draarivpatel-ui/ratecage/badge)](https://scorecard.dev/viewer/?uri=github.com/draarivpatel-ui/ratecage)
+
 ratecage is a zero-dependency Node.js security library for HTTP and API rate limiting. It combines deterministic rate-limit algorithms, memory-bounded key storage, spoof-resistant client IP extraction, standard rate-limit headers, a Node HTTP middleware adapter, a Fetch adapter, a static configuration linter, and a small CLI.
 
 ## Status
@@ -458,4 +460,4 @@ npm run smoke
 npm pack --dry-run
 ```
 
-The test runner explicitly enumerates `tests/*.test.mjs` so glob behavior is consistent on Windows and Unix. The package has no runtime or development dependencies. Tests use only the Node.js built-in test runner. The checked-in suite currently passes 686 tests. Clocks used for tests or embedded systems should be monotonic; backward movement is treated conservatively and does not erase limiter state or store TTLs.
+The test runner explicitly enumerates `tests/*.test.mjs` so glob behavior is consistent on Windows and Unix. The package has no runtime dependencies. The only development dependency is the pinned fast-check property-testing library, and core tests use the Node.js built-in test runner. The checked-in suite currently passes 686 tests. Clocks used for tests or embedded systems should be monotonic; backward movement is treated conservatively and does not erase limiter state or store TTLs.
