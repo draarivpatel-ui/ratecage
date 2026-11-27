@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { extractClientIp } from '../src/index.mjs';
+import { extractClientIp, createNodeRateLimitMiddleware, createRateCage } from '../src/index.mjs';
 
 const spoofHeaders = [
   '1.1.1.1',
@@ -276,6 +276,88 @@ test('Forwarded is used only when XFF is absent', () => {
     forwarded: 'for=198.51.100.20',
     trustedProxies: ['10.0.0.0/8']
   }), '198.51.100.20');
+});
+
+for (const malformedValue of [['198.51.100.10'], null, 42, false]) {
+  test('a non-string XFF value cannot force fallback to Forwarded', () => {
+    assert.equal(extractClientIp({
+      socketIp: '10.0.0.1',
+      xForwardedFor: malformedValue,
+      forwarded: 'for=198.51.100.20',
+      trustedProxies: ['10.0.0.0/8']
+    }), '10.0.0.1');
+  });
+}
+
+test('the exact multi-proxy right-to-left chain selects the real client', () => {
+  assert.equal(extractClientIp({
+    socketIp: '10.0.0.1',
+    xForwardedFor: '203.0.113.99, 198.51.100.20, 10.0.0.2, 10.0.0.1',
+    trustedProxies: ['10.0.0.0/8']
+  }), '198.51.100.20');
+});
+
+test('an all-trusted XFF chain resolves to the leftmost evaluated hop', () => {
+  assert.equal(extractClientIp({
+    socketIp: '10.0.0.1',
+    xForwardedFor: '10.0.0.9, 10.0.0.2, 10.0.0.1',
+    trustedProxies: ['10.0.0.0/8']
+  }), '10.0.0.9');
+});
+
+test('IPv4-mapped socket addresses match IPv4 trusted proxy CIDRs', () => {
+  assert.equal(extractClientIp({
+    socketIp: '::ffff:10.0.0.1',
+    xForwardedFor: '198.51.100.20',
+    trustedProxies: ['10.0.0.0/8']
+  }), '198.51.100.20');
+});
+
+test('trusted proxy CIDR objects are copied before they are retained', async () => {
+  const mutable = {
+    family: 4,
+    bits: 32,
+    prefix: 32,
+    networkValue: 0x0a000001n
+  };
+  const mw = createNodeRateLimitMiddleware({
+    limit: 1,
+    windowMs: 1000,
+    now: () => 0,
+    trustedProxies: [mutable]
+  });
+  mutable.prefix = 0;
+  mutable.networkValue = 0n;
+  const response = () => ({
+    headersSent: false,
+    writableEnded: false,
+    statusCode: 200,
+    setHeader() {},
+    end() {}
+  });
+  const first = await mw({
+    headers: { 'x-forwarded-for': '198.51.100.20' },
+    socket: { remoteAddress: '192.0.2.10' }
+  }, response(), () => {});
+  const second = await mw({
+    headers: { 'x-forwarded-for': '198.51.100.21' },
+    socket: { remoteAddress: '192.0.2.10' }
+  }, response(), () => {});
+  assert.equal(first, true);
+  assert.equal(second, false);
+});
+
+test('createRateCage extraction retains a snapshot of trusted proxy CIDR objects', () => {
+  const mutable = {
+    family: 4,
+    bits: 32,
+    prefix: 32,
+    networkValue: 0x0a000001n
+  };
+  const cage = createRateCage({ trustedProxies: [mutable] });
+  mutable.prefix = 0;
+  mutable.networkValue = 0n;
+  assert.equal(cage.extractClientIp('192.0.2.10', '198.51.100.20'), '192.0.2.10');
 });
 
 test('invalid request cost carries the dedicated error code', async () => {

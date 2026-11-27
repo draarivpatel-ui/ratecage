@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createRateLimiter } from '../src/index.mjs';
+import { createRateLimiter, MemoryRateStore } from '../src/index.mjs';
 import { makeClock } from './helpers.mjs';
 
 function bucket(options = {}) {
@@ -159,4 +159,25 @@ test('token-bucket backward clock movement does not create retroactive refill la
   assert.equal((await limiter.consume('a')).allowed, false);
   clock.set(6000);
   assert.equal((await limiter.consume('a')).allowed, true);
+});
+
+test('token-bucket snaps microscopic floating-point residue after exact-cost cycles', async () => {
+  let now = 0;
+  const refillPerSecond = 0.3;
+  const step = 1000 / refillPerSecond;
+  const store = new MemoryRateStore({ now: () => now });
+  const limiter = createRateLimiter({
+    algorithm: 'token-bucket',
+    capacity: 2,
+    refillPerSecond,
+    now: () => now,
+    store
+  });
+  assert.equal((await limiter.consume('drift', { cost: 2 })).allowed, true);
+  for (let iteration = 0; iteration < 2000; iteration += 1) {
+    now += step;
+    assert.equal((await limiter.consume('drift')).allowed, true);
+  }
+  const state = store.get('ratecage:drift');
+  assert.equal(state.t, 0);
 });

@@ -165,6 +165,20 @@ test('Fetch adapter clones responses whose headers object cannot be mutated', as
   assert.equal(await response.text(), 'ok');
 });
 
+test('Fetch adapter clones a real redirect response with immutable headers', async () => {
+  const clock = makeClock(0);
+  const handler = createFetchRateLimitHandler(() => Response.redirect('https://example.test/next', 302), {
+    limit: 1,
+    windowMs: 1000,
+    now: clock.now,
+    socketIp: '203.0.113.10'
+  });
+  const response = await handler(req());
+  assert.equal(response.status, 302);
+  assert.equal(response.headers.get('location'), 'https://example.test/next');
+  assert.ok(response.headers.get('ratelimit'));
+});
+
 test('Fetch adapter preserves response status and statusText', async () => {
   const clock = makeClock(0);
   const handler = createFetchRateLimitHandler(() => okResponse('created', { status: 201, statusText: 'Created' }), {

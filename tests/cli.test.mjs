@@ -229,6 +229,20 @@ test('CLI errors neutralize ANSI control characters in paths', () => {
   assert.equal(result.stderr.includes('\x1b'), false);
 });
 
+test('CLI errors neutralize bidi control characters in commands', () => {
+  const result = cli(['bad-\u202e-command']);
+  assert.equal(result.status, 2);
+  assert.equal(result.stderr.includes('\u202e'), false);
+});
+
+test('CLI config reader uses non-blocking no-follow open flags and bounded reads', () => {
+  const source = fs.readFileSync(bin, 'utf8');
+  assert.match(source, /O_NOFOLLOW/);
+  assert.match(source, /O_NONBLOCK/);
+  assert.match(source, /readSync/);
+  assert.match(source, /MAX_CONFIG_FILE_BYTES \+ 1/);
+});
+
 test('CLI lint-config rejects unknown flags', () => {
   const file = configFile('clean2.json', '{"maxKeys":50000}');
   const result = cli(['lint-config', '--config', file, '--bogus']);

@@ -6,7 +6,7 @@ import { extractClientIp, lintRateLimitConfig } from '../src/index.mjs';
 const MAX_CONFIG_FILE_BYTES = 1024 * 1024;
 
 function neutralize(text) {
-  return String(text).replace(/[\x00-\x1f\x7f]/g, ' ');
+  return String(text).replace(/[\x00-\x1f\x7f-\x9f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069\ufeff]/g, ' ');
 }
 
 function writeError(message) {
@@ -79,9 +79,10 @@ function readConfigFile(filePath) {
   const earlyRejection = statRejection(filePath);
   if (earlyRejection !== null) throw new Error(earlyRejection);
   const noFollow = typeof fs.constants.O_NOFOLLOW === 'number' ? fs.constants.O_NOFOLLOW : 0;
+  const nonBlock = typeof fs.constants.O_NONBLOCK === 'number' ? fs.constants.O_NONBLOCK : 0;
   let fd;
   try {
-    fd = fs.openSync(filePath, fs.constants.O_RDONLY | noFollow);
+    fd = fs.openSync(filePath, fs.constants.O_RDONLY | noFollow | nonBlock);
   } catch {
     throw new Error('configuration file cannot be opened safely');
   }
@@ -89,7 +90,15 @@ function readConfigFile(filePath) {
     const stat = fs.fstatSync(fd);
     if (!stat.isFile()) throw new Error('configuration path must be a regular file');
     if (stat.size > MAX_CONFIG_FILE_BYTES) throw new Error('configuration file is too large');
-    return fs.readFileSync(fd, 'utf8');
+    const buffer = Buffer.allocUnsafe(MAX_CONFIG_FILE_BYTES + 1);
+    let total = 0;
+    while (total < buffer.length) {
+      const bytesRead = fs.readSync(fd, buffer, total, buffer.length - total, null);
+      if (bytesRead === 0) break;
+      total += bytesRead;
+    }
+    if (total > MAX_CONFIG_FILE_BYTES) throw new Error('configuration file is too large');
+    return buffer.subarray(0, total).toString('utf8');
   } finally {
     fs.closeSync(fd);
   }

@@ -188,6 +188,13 @@ for (const [input, prefix, expected] of ipv6Buckets) {
   });
 }
 
+test('IPv6 spelling and interface identifier rotation canonicalize to one /64 bucket', () => {
+  const first = normalizeIp('2001:0db8:0000:0000::1', { ipv6Prefix: 64 });
+  const second = normalizeIp('2001:db8::ffff:ffff:ffff:ffff', { ipv6Prefix: 64 });
+  assert.equal(first, '2001:db8::');
+  assert.equal(second, first);
+});
+
 test('normalizeIp rejects an invalid ipv6Prefix option', () => {
   assert.throws(() => normalizeIp('2001:db8::1', { ipv6Prefix: 129 }), /ipv6Prefix/);
 });

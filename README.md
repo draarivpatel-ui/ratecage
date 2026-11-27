@@ -298,7 +298,7 @@ const result = await limiter.consume('203.0.113.10');
 // result.key is login:203.0.113.10
 ```
 
-Oversized keys are not silently truncated. The variable key material is hashed with SHA-256 inside the namespace, so repeated oversized keys still share one deterministic bucket without letting unbounded key text consume memory. Raw keys have a hard 64 KiB input cap. Namespace names may contain ASCII letters, digits, dot, underscore, and hyphen; colon is rejected so separate namespaces cannot be concatenated into the same storage key.
+Oversized keys are not silently truncated. The variable key material is hashed with SHA-256 inside the namespace, so repeated oversized keys still share one deterministic bucket without letting unbounded key text consume memory. Keys beginning with the reserved `sha256:` prefix are always hashed, which prevents a short attacker-chosen key from colliding with the encoded bucket of an oversized key. Raw keys have a hard 64 KiB input cap. Namespace names may contain ASCII letters, digits, dot, underscore, and hyphen; colon is rejected so separate namespaces cannot be concatenated into the same storage key.
 
 ## Headers
 
@@ -357,7 +357,7 @@ When denied, the middleware sends:
 - `Retry-After`
 - `Cache-Control: no-store`
 
-It reads the direct peer from `req.socket.remoteAddress` or `req.connection.remoteAddress`. It does not mutate the caller's options object. If response headers were already sent, it does not write a second response.
+It reads the direct peer from `req.socket.remoteAddress` or `req.connection.remoteAddress`. If neither source yields an address, unidentified traffic shares one fail-closed bucket instead of bypassing the limiter. It does not mutate the caller's options object. If response headers were already sent, it does not write a second response.
 
 ## Fetch adapter
 
@@ -416,7 +416,7 @@ Exit codes:
 - `1`: lint findings were present
 - `2`: usage error, invalid input, invalid JSON, or unsafe configuration file
 
-The config reader rejects directories, devices, FIFOs, symbolic links, and oversized files. It uses `O_NOFOLLOW` where the platform supports it and verifies the opened file with `fstat`. CLI error output neutralizes ANSI control characters.
+The config reader rejects directories, devices, FIFOs, symbolic links, and oversized files. It uses `O_NOFOLLOW` and `O_NONBLOCK` where the platform supports them, verifies the opened file with `fstat`, and reads at most one byte beyond the configured size cap so concurrent file growth cannot become an unbounded read. CLI error output neutralizes ANSI and bidirectional control characters.
 
 ## API summary
 
@@ -458,4 +458,4 @@ npm run smoke
 npm pack --dry-run
 ```
 
-The test runner explicitly enumerates `tests/*.test.mjs` so glob behavior is consistent on Windows and Unix. The package has no runtime or development dependencies. Clocks used for tests or embedded systems should be monotonic; backward movement is treated conservatively and does not erase limiter state or store TTLs.
+The test runner explicitly enumerates `tests/*.test.mjs` so glob behavior is consistent on Windows and Unix. The package has no runtime or development dependencies. Tests use only the Node.js built-in test runner. The checked-in suite currently passes 686 tests. Clocks used for tests or embedded systems should be monotonic; backward movement is treated conservatively and does not erase limiter state or store TTLs.

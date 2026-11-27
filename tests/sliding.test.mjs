@@ -213,6 +213,15 @@ test('createRateLimitKey hashes oversized keys without truncation', () => {
   assert.ok(key.length <= 256);
 });
 
+test('createRateLimitKey reserves the hashed-key prefix against collisions', () => {
+  const raw = 'user-' + 'x'.repeat(500);
+  const digest = crypto.createHash('sha256').update(raw, 'utf8').digest('hex');
+  const oversizedBucket = createRateLimitKey('api', raw, 104);
+  const craftedBucket = createRateLimitKey('api', 'sha256:' + digest, 104);
+  assert.notEqual(craftedBucket, oversizedBucket);
+  assert.equal(craftedBucket, createRateLimitKey('api', 'sha256:' + digest, 104));
+});
+
 test('oversized user keys share one deterministic hashed bucket', async () => {
   const { limiter } = sliding({ limit: 1, namespace: 'api' });
   const raw = 'user-' + 'x'.repeat(500);

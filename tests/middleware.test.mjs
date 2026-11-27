@@ -123,6 +123,12 @@ test('Node middleware supports connection fallback for the socket address', asyn
   assert.equal((await invoke(mw, req, createMockResponse())).result, false);
 });
 
+test('Node middleware missing socket identity fails closed in one shared bucket', async () => {
+  const { mw } = middleware({ limit: 1 });
+  assert.equal((await invoke(mw, { headers: {} }, createMockResponse())).result, true);
+  assert.equal((await invoke(mw, { headers: {}, socket: {} }, createMockResponse())).result, false);
+});
+
 test('Node middleware skip bypasses limiting and calls next', async () => {
   const { mw } = middleware({ limit: 1, skip: () => true });
   const req = requestFor('203.0.113.10');

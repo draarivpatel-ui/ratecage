@@ -452,6 +452,15 @@ function ipParsedInCidr(parsedIp, parsedCidr) {
   return (parsedIp.value >> shift) === (parsedCidr.networkValue >> shift);
 }
 
+function copyCidrForTrust(cidr) {
+  return Object.freeze({
+    family: cidr.family,
+    bits: cidr.bits,
+    prefix: cidr.prefix,
+    networkValue: cidr.networkValue
+  });
+}
+
 function prepareTrustedProxies(value) {
   if (value === undefined) return Object.freeze([]);
   if (!Array.isArray(value)) invalidOptions('trustedProxies must be an array', 'trustedProxies');
@@ -459,7 +468,7 @@ function prepareTrustedProxies(value) {
   const output = [];
   for (const entry of value) {
     try {
-      output.push(parseCidrObject(entry));
+      output.push(copyCidrForTrust(parseCidrObject(entry)));
     } catch (error) {
       if (error instanceof RateCageError) invalidOptions('trustedProxies entries must be strict IP or CIDR values', 'trustedProxies');
       throw error;
@@ -666,7 +675,7 @@ function extractClientIp(socketIp, xForwardedFor, options) {
   if (!socketTrusted) return socketResult;
 
   let tokens = null;
-  if (typeof opts.xForwardedFor === 'string') {
+  if (opts.xForwardedFor !== undefined) {
     tokens = parseXForwardedFor(opts.xForwardedFor, maxBytes);
   } else {
     tokens = parseForwarded(opts.forwarded, maxBytes);
@@ -862,7 +871,7 @@ function createRateLimitKey(namespace, key, maxKeyLength = DEFAULTS.maxKeyLength
     invalidInput('maxKeyLength must be a safe integer in range');
   }
   const directBytes = byteLength(validNamespace) + 1 + byteLength(key);
-  if (directBytes <= maxKeyLength) return validNamespace + ':' + key;
+  if (!key.startsWith('sha256:') && directBytes <= maxKeyLength) return validNamespace + ':' + key;
   const digest = crypto.createHash('sha256').update(key, 'utf8').digest('hex');
   const hashed = validNamespace + ':sha256:' + digest;
   if (byteLength(hashed) > maxKeyLength) {
@@ -1008,16 +1017,22 @@ function computeSlidingWindow(current, now, config, cost, consume) {
   };
 }
 
+function snapTokenPrecision(tokens) {
+  const nearest = Math.round(tokens);
+  if (Math.abs(tokens - nearest) <= EPSILON) return nearest;
+  return tokens;
+}
+
 function computeTokenBucket(current, now, config, cost, consume) {
   let state = validateBucketState(current);
   if (state === undefined) state = { v: 1, t: config.capacity, u: now };
   const elapsed = Math.max(0, now - state.u);
   const refill = elapsed * config.refillPerSecond / 1000;
-  let tokens = Math.min(config.capacity, state.t + refill);
+  let tokens = snapTokenPrecision(Math.min(config.capacity, state.t + refill));
   if (config.capacity - tokens < EPSILON) tokens = config.capacity;
   const costExceeded = cost > config.capacity;
   const allowed = !costExceeded && tokens + EPSILON >= cost;
-  if (allowed && consume) tokens = Math.max(0, tokens - cost);
+  if (allowed && consume) tokens = snapTokenPrecision(Math.max(0, tokens - cost));
   const updatedState = { v: 1, t: tokens, u: Math.max(now, state.u) };
   const retryAfterMs = allowed || costExceeded ? (costExceeded ? 1 : 0) :
     Math.max(1, Math.ceil(((cost - tokens) / config.refillPerSecond) * 1000));
@@ -1745,6 +1760,7 @@ function createRateCage(options) {
     'socketIp'
   ]);
   const opts = copyOwnOptions(options, keys, 'ratecage options');
+  const compiledTrustedProxies = prepareTrustedProxies(opts.trustedProxies);
   const limiter = createRateLimiter(pickRateOptions(opts));
   const adapterOptions = Object.create(null);
   for (const key of Object.keys(opts)) adapterOptions[key] = opts[key];
@@ -1754,7 +1770,8 @@ function createRateCage(options) {
   function extract(socketIp, xForwardedFor, overrides) {
     const merged = Object.create(null);
     for (const key of ['trustedProxies', 'maxForwardedHops', 'maxForwardedHeaderBytes', 'ipv6Prefix']) {
-      if (Object.hasOwn(opts, key)) merged[key] = opts[key];
+      if (!Object.hasOwn(opts, key)) continue;
+      merged[key] = key === 'trustedProxies' ? compiledTrustedProxies : opts[key];
     }
     if (isObjectLike(xForwardedFor) && typeof xForwardedFor !== 'string' && !Array.isArray(xForwardedFor)) {
       for (const key of Object.keys(xForwardedFor)) merged[key] = xForwardedFor[key];
