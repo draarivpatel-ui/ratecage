@@ -1,0 +1,64 @@
+{
+  "name": "ratecage",
+  "version": "1.0.0",
+  "description": "Zero-dependency HTTP and API rate limiting with spoof-resistant client IP extraction, bounded memory, sliding windows and token buckets for Node.js",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/draarivpatel-ui/ratecage.git"
+  },
+  "homepage": "https://github.com/draarivpatel-ui/ratecage#readme",
+  "bugs": {
+    "url": "https://github.com/draarivpatel-ui/ratecage/issues"
+  },
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./src/index.mjs",
+  "types": "./types/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./types/index.d.ts",
+      "import": "./src/index.mjs",
+      "require": "./dist/index.cjs"
+    },
+    "./package.json": "./package.json"
+  },
+  "bin": {
+    "ratecage": "bin/ratecage.mjs"
+  },
+  "files": [
+    "src",
+    "dist",
+    "types",
+    "bin",
+    "docs",
+    "README.md",
+    "SECURITY.md",
+    "CONTRIBUTING.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build:cjs": "node scripts/build-cjs.mjs",
+    "check:cjs": "node scripts/build-cjs.mjs --check",
+    "smoke": "node scripts/smoke.mjs",
+    "test": "node scripts/run-tests.mjs"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "security",
+    "rate-limit",
+    "rate-limiter",
+    "brute-force",
+    "api-security",
+    "token-bucket",
+    "sliding-window",
+    "x-forwarded-for",
+    "proxy",
+    "zero-dependency"
+  ],
+  "license": "MIT",
+  "sideEffects": false,
+  "dependencies": {},
+  "devDependencies": {}
+}

@@ -1,0 +1,42 @@
+name: Bug report
+description: Report incorrect ratecage behavior
+title: "bug: "
+labels: [bug]
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What happened, and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Include code, configuration, input headers, or CLI input. Remove secrets and real tokens.
+    validations:
+      required: true
+  - type: input
+    id: node
+    attributes:
+      label: Node.js version
+      placeholder: 20.x
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - IP extraction
+        - Memory store
+        - Sliding window
+        - Fixed window
+        - Token bucket
+        - Node middleware
+        - Fetch adapter
+        - CLI or linter
+        - Packaging or types
+    validations:
+      required: true

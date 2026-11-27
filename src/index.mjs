@@ -1,0 +1,1809 @@
+import crypto from 'node:crypto';
+
+export const CODE = Object.freeze({
+  INVALID_INPUT: 'ERR_RATECAGE_INVALID_INPUT',
+  INVALID_OPTIONS: 'ERR_RATECAGE_INVALID_OPTIONS',
+  INVALID_IP: 'ERR_RATECAGE_INVALID_IP',
+  INVALID_CIDR: 'ERR_RATECAGE_INVALID_CIDR',
+  INVALID_KEY: 'ERR_RATECAGE_INVALID_KEY',
+  INVALID_COST: 'ERR_RATECAGE_INVALID_COST',
+  INVALID_STATE: 'ERR_RATECAGE_INVALID_STATE',
+  INVALID_CONFIG: 'ERR_RATECAGE_INVALID_CONFIG',
+  STORE_ERROR: 'ERR_RATECAGE_STORE_ERROR'
+});
+
+export const RESULT_CODE = Object.freeze({
+  OK: 'OK',
+  RATE_LIMITED: 'RATE_LIMITED',
+  COST_EXCEEDS_LIMIT: 'COST_EXCEEDS_LIMIT',
+  STORE_ERROR: 'STORE_ERROR',
+  INVALID_INPUT: 'INVALID_INPUT'
+});
+
+export const DEFAULTS = Object.freeze({
+  algorithm: 'sliding-window',
+  limit: 60,
+  windowMs: 60000,
+  namespace: 'ratecage',
+  maxKeys: 50000,
+  maxKeyLength: 256,
+  trustedProxies: Object.freeze([]),
+  maxForwardedHops: 16,
+  maxForwardedHeaderBytes: 2048,
+  ipv6Prefix: 64,
+  cost: 1,
+  onStoreError: 'deny'
+});
+
+const MAX_LIMIT = 1000000000;
+const MAX_COST = 1000000;
+const MAX_WINDOW_MS = 604800000;
+const MAX_STORE_TTL_MS = 2592000000;
+const MAX_KEYS_LIMIT = 1000000;
+const MAX_STORE_KEY_LENGTH = 4096;
+const MAX_NAMESPACE_LENGTH = 32;
+const MAX_TRUSTED_PROXIES = 256;
+const MAX_FORWARDED_HOPS_LIMIT = 128;
+const MAX_FORWARDED_BYTES_LIMIT = 16384;
+const MAX_CONFIG_BYTES = 1048576;
+const MAX_RAW_KEY_BYTES = 65536;
+const EPSILON = 1e-9;
+const CONTROL_CHARS_RE = /[\x00-\x1f\x7f]/;
+const NAMESPACE_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$/;
+const IPV4_PART_RE = /^(0|[1-9][0-9]{0,2})$/;
+const IPV6_HEX_RE = /^[0-9A-Fa-f]{1,4}$/;
+const DIGITS_RE = /^[0-9]+$/;
+const HEADER_PARAM_NAME_RE = /^[A-Za-z][A-Za-z0-9!#$%&'*+.^_`|~-]*$/;
+
+export class RateCageError extends Error {
+  constructor(code, reason, details = {}) {
+    super(reason);
+    this.name = 'RateCageError';
+    this.code = code;
+    this.reason = reason;
+    if (details.field !== undefined) this.field = details.field;
+    if (details.limit !== undefined) this.limit = details.limit;
+    if (details.actual !== undefined) this.actual = details.actual;
+    if (details.cause !== undefined) this.cause = details.cause;
+  }
+
+  toJSON() {
+    const output = {
+      name: this.name,
+      code: this.code,
+      reason: this.reason,
+      message: this.message
+    };
+    if (this.field !== undefined) output.field = this.field;
+    if (this.limit !== undefined) output.limit = this.limit;
+    if (this.actual !== undefined) output.actual = this.actual;
+    return output;
+  }
+}
+
+function fail(code, reason, details) {
+  throw new RateCageError(code, reason, details);
+}
+
+function invalidInput(reason) {
+  fail(CODE.INVALID_INPUT, reason);
+}
+
+function invalidOptions(reason, field) {
+  fail(CODE.INVALID_OPTIONS, reason, field === undefined ? undefined : { field });
+}
+
+function invalidIp(reason) {
+  fail(CODE.INVALID_IP, reason);
+}
+
+function invalidCidr(reason) {
+  fail(CODE.INVALID_CIDR, reason);
+}
+
+function invalidKey(reason) {
+  fail(CODE.INVALID_KEY, reason);
+}
+
+function invalidCost(reason) {
+  fail(CODE.INVALID_COST, reason);
+}
+
+function isObjectLike(value) {
+  return value !== null && (typeof value === 'object' || typeof value === 'function');
+}
+
+function copyOwnOptions(input, allowedKeys, label) {
+  if (input === undefined) return Object.create(null);
+  if (!isObjectLike(input) || Array.isArray(input)) invalidInput(label + ' must be an object');
+  const allowed = new Set(allowedKeys);
+  const copy = Object.create(null);
+  for (const key of Object.keys(input)) {
+    if (!allowed.has(key)) invalidOptions(label + ' contain an unknown key', key);
+    copy[key] = input[key];
+  }
+  for (const key of allowedKeys) {
+    if (!Object.hasOwn(input, key) && key in input) {
+      invalidOptions(label + ' must use own properties rather than inherited properties', key);
+    }
+  }
+  return copy;
+}
+
+function booleanValue(value, fallback, field) {
+  if (value === undefined) return fallback;
+  if (typeof value !== 'boolean') invalidOptions(field + ' must be a boolean', field);
+  return value;
+}
+
+function integerValue(value, fallback, min, max, field) {
+  if (value === undefined) return fallback;
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < min || value > max) {
+    invalidOptions(field + ' must be a safe integer in range', field);
+  }
+  return value;
+}
+
+function finiteNumberValue(value, fallback, min, max, field) {
+  if (value === undefined) return fallback;
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < min || value > max) {
+    invalidOptions(field + ' must be a finite number in range', field);
+  }
+  return value;
+}
+
+function functionValue(value, fallback, field) {
+  if (value === undefined) return fallback;
+  if (typeof value !== 'function') invalidOptions(field + ' must be a function', field);
+  return value;
+}
+
+function hasControlChars(value) {
+  return CONTROL_CHARS_RE.test(value);
+}
+
+function byteLength(value) {
+  return Buffer.byteLength(value, 'utf8');
+}
+
+function parseIpv4Strict(text) {
+  if (typeof text !== 'string' || text.length === 0 || text.length > 15) return null;
+  const parts = text.split('.');
+  if (parts.length !== 4) return null;
+  let value = 0n;
+  const octets = [];
+  for (const part of parts) {
+    if (!IPV4_PART_RE.test(part)) return null;
+    const number = Number(part);
+    if (!Number.isSafeInteger(number) || number < 0 || number > 255) return null;
+    octets.push(number);
+    value = (value << 8n) | BigInt(number);
+  }
+  return {
+    family: 4,
+    sourceFamily: 4,
+    bits: 32,
+    value,
+    octets,
+    groups: null,
+    ipv4Mapped: false,
+    canonical: octets.join('.')
+  };
+}
+
+function parseIpv6Side(side, allowIpv4Tail) {
+  if (side === '') return [];
+  const tokens = side.split(':');
+  const groups = [];
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index];
+    if (token === '') return null;
+    if (token.includes('.')) {
+      if (!allowIpv4Tail || index !== tokens.length - 1) return null;
+      const ipv4 = parseIpv4Strict(token);
+      if (ipv4 === null) return null;
+      const number = Number(ipv4.value);
+      groups.push((number >>> 16) & 0xffff, number & 0xffff);
+    } else {
+      if (!IPV6_HEX_RE.test(token)) return null;
+      groups.push(Number.parseInt(token, 16));
+    }
+  }
+  return groups;
+}
+
+function parseIpv6Strict(text) {
+  if (typeof text !== 'string' || text.length === 0 || text.length > 45) return null;
+  if (text.includes('%') || text.includes('[') || text.includes(']')) return null;
+  if (hasControlChars(text) || text.trim() !== text) return null;
+  const compressionCount = text.split('::').length - 1;
+  if (compressionCount > 1) return null;
+  let groups;
+  if (compressionCount === 1) {
+    const parts = text.split('::');
+    const head = parseIpv6Side(parts[0], false);
+    const tail = parseIpv6Side(parts[1], true);
+    if (head === null || tail === null) return null;
+    const present = head.length + tail.length;
+    if (present > 7) return null;
+    groups = head.concat(new Array(8 - present).fill(0), tail);
+  } else {
+    groups = parseIpv6Side(text, true);
+    if (groups === null || groups.length !== 8) return null;
+  }
+  if (groups.length !== 8 || groups.some((group) => !Number.isInteger(group) || group < 0 || group > 0xffff)) return null;
+  let value = 0n;
+  for (const group of groups) value = (value << 16n) | BigInt(group);
+  return { groups, value };
+}
+
+function canonicalIpv6(groups) {
+  let bestStart = -1;
+  let bestLength = 0;
+  let index = 0;
+  while (index < groups.length) {
+    if (groups[index] !== 0) {
+      index += 1;
+      continue;
+    }
+    let end = index;
+    while (end < groups.length && groups[end] === 0) end += 1;
+    const length = end - index;
+    if (length >= 2 && length > bestLength) {
+      bestStart = index;
+      bestLength = length;
+    }
+    index = end;
+  }
+  if (bestStart === -1) return groups.map((group) => group.toString(16)).join(':');
+  const left = groups.slice(0, bestStart).map((group) => group.toString(16)).join(':');
+  const right = groups.slice(bestStart + bestLength).map((group) => group.toString(16)).join(':');
+  if (left !== '' && right !== '') return left + '::' + right;
+  if (left !== '') return left + '::';
+  if (right !== '') return '::' + right;
+  return '::';
+}
+
+function ipv6GroupsToBigInt(groups) {
+  let value = 0n;
+  for (const group of groups) value = (value << 16n) | BigInt(group);
+  return value;
+}
+
+function bigIntToIpv6Groups(value) {
+  const groups = [];
+  for (let index = 0; index < 8; index += 1) {
+    groups[index] = Number((value >> BigInt((7 - index) * 16)) & 0xffffn);
+  }
+  return groups;
+}
+
+function isIpv4MappedGroups(groups) {
+  return groups[0] === 0 && groups[1] === 0 && groups[2] === 0 && groups[3] === 0 &&
+    groups[4] === 0 && groups[5] === 0xffff;
+}
+
+function parseIpStrict(value) {
+  if (typeof value !== 'string') return null;
+  if (value.length === 0 || value.length > 45 || hasControlChars(value) || value.trim() !== value) return null;
+  const ipv4 = parseIpv4Strict(value);
+  if (ipv4 !== null) return ipv4;
+  const ipv6 = parseIpv6Strict(value);
+  if (ipv6 === null) return null;
+  if (isIpv4MappedGroups(ipv6.groups)) {
+    const low = Number(ipv6.value & 0xffffffffn);
+    const octets = [
+      (low >>> 24) & 0xff,
+      (low >>> 16) & 0xff,
+      (low >>> 8) & 0xff,
+      low & 0xff
+    ];
+    return {
+      family: 4,
+      sourceFamily: 6,
+      bits: 32,
+      value: BigInt(low >>> 0),
+      octets,
+      groups: ipv6.groups,
+      ipv4Mapped: true,
+      canonical: octets.join('.')
+    };
+  }
+  return {
+    family: 6,
+    sourceFamily: 6,
+    bits: 128,
+    value: ipv6.value,
+    octets: null,
+    groups: ipv6.groups,
+    ipv4Mapped: false,
+    canonical: canonicalIpv6(ipv6.groups)
+  };
+}
+
+function parseIpOrThrow(value) {
+  const parsed = parseIpStrict(value);
+  if (parsed === null) invalidIp('IP address must be a strict dotted IPv4 or IPv6 address');
+  return parsed;
+}
+
+function readIpv6Prefix(value, fallback, field) {
+  if (value === undefined) return fallback;
+  if (value === false || value === null) return false;
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0 || value > 128) {
+    invalidOptions(field + ' must be false or an integer from 0 through 128', field);
+  }
+  return value;
+}
+
+function maskBigInt(bits, prefix) {
+  if (prefix === 0) return 0n;
+  return ((1n << BigInt(prefix)) - 1n) << BigInt(bits - prefix);
+}
+
+function bucketIpv6Parsed(parsed, prefix) {
+  if (parsed.family !== 6 || prefix === false || prefix === 128) return parsed.canonical;
+  const mask = maskBigInt(128, prefix);
+  const network = parsed.value & mask;
+  return canonicalIpv6(bigIntToIpv6Groups(network));
+}
+
+export function normalizeIp(ip, options) {
+  const opts = copyOwnOptions(options, ['ipv6Prefix'], 'normalizeIp options');
+  const prefix = readIpv6Prefix(opts.ipv6Prefix, false, 'ipv6Prefix');
+  const parsed = parseIpOrThrow(ip);
+  if (parsed.family === 4) return parsed.canonical;
+  return bucketIpv6Parsed(parsed, prefix);
+}
+
+export function parseCidr(cidr) {
+  if (typeof cidr !== 'string' || cidr.length === 0 || cidr.length > 60) {
+    invalidCidr('CIDR must be a non-empty string');
+  }
+  if (hasControlChars(cidr) || cidr.trim() !== cidr || /\s/.test(cidr)) {
+    invalidCidr('CIDR must not contain whitespace or control characters');
+  }
+  const slashCount = (cidr.match(/\//g) || []).length;
+  if (slashCount > 1) invalidCidr('CIDR must contain at most one slash');
+  const slashIndex = cidr.indexOf('/');
+  const addressText = slashIndex === -1 ? cidr : cidr.slice(0, slashIndex);
+  const prefixText = slashIndex === -1 ? '' : cidr.slice(slashIndex + 1);
+  if (addressText === '') invalidCidr('CIDR address is missing');
+  const parsed = parseIpStrict(addressText);
+  if (parsed === null) invalidCidr('CIDR address must be a strict IP address');
+  let prefix;
+  if (slashIndex === -1) {
+    prefix = parsed.family === 4 ? 32 : 128;
+  } else {
+    if (!DIGITS_RE.test(prefixText) || (prefixText.length > 1 && prefixText.startsWith('0'))) {
+      invalidCidr('CIDR prefix must be a canonical decimal integer');
+    }
+    prefix = Number(prefixText);
+    const maxPrefix = parsed.ipv4Mapped ? 128 : parsed.bits;
+    if (!Number.isSafeInteger(prefix) || prefix < 0 || prefix > maxPrefix) {
+      invalidCidr('CIDR prefix is outside the address length');
+    }
+    if (parsed.ipv4Mapped) {
+      if (prefix < 96) invalidCidr('IPv4-mapped IPv6 CIDR prefixes must be at least 96');
+      prefix -= 96;
+    }
+  }
+  const bits = parsed.family === 4 ? 32 : 128;
+  const mask = maskBigInt(bits, prefix);
+  const networkValue = parsed.value & mask;
+  let network;
+  if (parsed.family === 4) {
+    const number = Number(networkValue);
+    network = [
+      (number >>> 24) & 0xff,
+      (number >>> 16) & 0xff,
+      (number >>> 8) & 0xff,
+      number & 0xff
+    ].join('.');
+  } else {
+    network = canonicalIpv6(bigIntToIpv6Groups(networkValue));
+  }
+  return Object.freeze({
+    family: parsed.family,
+    bits,
+    prefix,
+    network,
+    networkValue,
+    input: cidr
+  });
+}
+
+function parseCidrObject(cidr) {
+  if (typeof cidr === 'string') return parseCidr(cidr);
+  if (!isObjectLike(cidr)) invalidCidr('CIDR must be a string or a parseCidr result');
+  const required = ['family', 'bits', 'prefix', 'networkValue'];
+  for (const key of required) {
+    if (!Object.hasOwn(cidr, key)) invalidCidr('parsed CIDR object is incomplete');
+  }
+  if ((cidr.family !== 4 && cidr.family !== 6) || typeof cidr.bits !== 'number' ||
+      typeof cidr.prefix !== 'number' || typeof cidr.networkValue !== 'bigint') {
+    invalidCidr('parsed CIDR object has invalid fields');
+  }
+  const expectedBits = cidr.family === 4 ? 32 : 128;
+  if (cidr.bits !== expectedBits || !Number.isSafeInteger(cidr.prefix) || cidr.prefix < 0 || cidr.prefix > cidr.bits ||
+      cidr.networkValue < 0n || cidr.networkValue >= (1n << BigInt(cidr.bits))) {
+    invalidCidr('parsed CIDR object fields are outside their valid ranges');
+  }
+  return cidr;
+}
+
+export function ipInCidr(ip, cidr) {
+  const parsedIp = parseIpOrThrow(ip);
+  const parsedCidr = parseCidrObject(cidr);
+  if (parsedIp.family !== parsedCidr.family) return false;
+  const shift = BigInt(parsedCidr.bits - parsedCidr.prefix);
+  if (parsedCidr.prefix === 0) return true;
+  return (parsedIp.value >> shift) === (parsedCidr.networkValue >> shift);
+}
+
+function ipParsedInCidr(parsedIp, parsedCidr) {
+  if (parsedIp.family !== parsedCidr.family) return false;
+  if (parsedCidr.prefix === 0) return true;
+  const shift = BigInt(parsedCidr.bits - parsedCidr.prefix);
+  return (parsedIp.value >> shift) === (parsedCidr.networkValue >> shift);
+}
+
+function prepareTrustedProxies(value) {
+  if (value === undefined) return Object.freeze([]);
+  if (!Array.isArray(value)) invalidOptions('trustedProxies must be an array', 'trustedProxies');
+  if (value.length > MAX_TRUSTED_PROXIES) invalidOptions('trustedProxies is too large', 'trustedProxies');
+  const output = [];
+  for (const entry of value) {
+    try {
+      output.push(parseCidrObject(entry));
+    } catch (error) {
+      if (error instanceof RateCageError) invalidOptions('trustedProxies entries must be strict IP or CIDR values', 'trustedProxies');
+      throw error;
+    }
+  }
+  return Object.freeze(output);
+}
+
+function stripOptionalBrackets(token) {
+  if (token.startsWith('[')) {
+    if (!token.endsWith(']') || token.length < 3) return null;
+    const inner = token.slice(1, -1);
+    if (inner.includes('[') || inner.includes(']') || !inner.includes(':')) return null;
+    return inner;
+  }
+  if (token.includes('[') || token.includes(']')) return null;
+  return token;
+}
+
+function parseXForwardedFor(header, maxBytes) {
+  if (typeof header !== 'string') return null;
+  if (header.length === 0 || byteLength(header) > maxBytes || hasControlChars(header)) return null;
+  const rawTokens = header.split(',');
+  const tokens = [];
+  for (const rawToken of rawTokens) {
+    const trimmed = rawToken.trim();
+    if (trimmed === '') return null;
+    const unbracketed = stripOptionalBrackets(trimmed);
+    if (unbracketed === null) return null;
+    const parsed = parseIpStrict(unbracketed);
+    if (parsed === null) return null;
+    tokens.push(parsed);
+  }
+  return tokens;
+}
+
+function splitOutsideQuotes(input, delimiter) {
+  const parts = [];
+  let current = '';
+  let quoted = false;
+  let escaped = false;
+  for (const character of input) {
+    if (escaped) {
+      current += character;
+      escaped = false;
+      continue;
+    }
+    if (quoted && character === '\\') {
+      escaped = true;
+      current += character;
+      continue;
+    }
+    if (character === '"') {
+      quoted = !quoted;
+      current += character;
+      continue;
+    }
+    if (!quoted && character === delimiter) {
+      parts.push(current);
+      current = '';
+      continue;
+    }
+    current += character;
+  }
+  if (quoted || escaped) return null;
+  parts.push(current);
+  return parts;
+}
+
+function unquoteForwardedValue(value) {
+  if (!value.startsWith('"')) return value;
+  if (value.length < 2 || !value.endsWith('"')) return null;
+  const inner = value.slice(1, -1);
+  let output = '';
+  let escaped = false;
+  for (const character of inner) {
+    if (escaped) {
+      if (character !== '"' && character !== '\\') return null;
+      output += character;
+      escaped = false;
+    } else if (character === '\\') {
+      escaped = true;
+    } else {
+      if (character === '"') return null;
+      output += character;
+    }
+  }
+  if (escaped) return null;
+  return output;
+}
+
+function stripForwardedPort(token) {
+  if (token.startsWith('[')) {
+    const closeIndex = token.indexOf(']');
+    if (closeIndex === -1) return null;
+    const address = token.slice(1, closeIndex);
+    const rest = token.slice(closeIndex + 1);
+    if (rest === '') return address;
+    if (!rest.startsWith(':')) return null;
+    const portText = rest.slice(1);
+    if (!DIGITS_RE.test(portText)) return null;
+    const port = Number(portText);
+    if (!Number.isSafeInteger(port) || port < 0 || port > 65535) return null;
+    return address;
+  }
+  const colonCount = (token.match(/:/g) || []).length;
+  if (colonCount === 1 && token.includes('.')) {
+    const separator = token.lastIndexOf(':');
+    const address = token.slice(0, separator);
+    const portText = token.slice(separator + 1);
+    if (!DIGITS_RE.test(portText)) return null;
+    const port = Number(portText);
+    if (!Number.isSafeInteger(port) || port < 0 || port > 65535) return null;
+    return address;
+  }
+  return token;
+}
+
+function parseForwardedElement(element) {
+  const parameters = splitOutsideQuotes(element, ';');
+  if (parameters === null) return null;
+  let forValue;
+  let forCount = 0;
+  for (const parameter of parameters) {
+    const trimmed = parameter.trim();
+    if (trimmed === '') return null;
+    const equalsIndex = trimmed.indexOf('=');
+    if (equalsIndex <= 0) return null;
+    const name = trimmed.slice(0, equalsIndex).trim().toLowerCase();
+    const value = trimmed.slice(equalsIndex + 1).trim();
+    if (!HEADER_PARAM_NAME_RE.test(name) || value === '') return null;
+    if (name !== 'for') continue;
+    forCount += 1;
+    if (forCount > 1) return null;
+    const unquoted = unquoteForwardedValue(value);
+    if (unquoted === null || hasControlChars(unquoted)) return null;
+    const withoutPort = stripForwardedPort(unquoted);
+    if (withoutPort === null) return null;
+    const parsed = parseIpStrict(withoutPort);
+    if (parsed === null) return null;
+    forValue = parsed;
+  }
+  return forCount === 1 ? forValue : null;
+}
+
+function parseForwarded(header, maxBytes) {
+  if (typeof header !== 'string') return null;
+  if (header.length === 0 || byteLength(header) > maxBytes || hasControlChars(header)) return null;
+  const elements = splitOutsideQuotes(header, ',');
+  if (elements === null) return null;
+  const tokens = [];
+  for (const element of elements) {
+    const parsed = parseForwardedElement(element);
+    if (parsed === null) return null;
+    tokens.push(parsed);
+  }
+  return tokens;
+}
+
+function normalizeExtractArguments(socketIp, xForwardedFor, options) {
+  if (isObjectLike(socketIp) && typeof socketIp !== 'string' && !Array.isArray(socketIp)) {
+    const merged = Object.create(null);
+    for (const key of Object.keys(socketIp)) merged[key] = socketIp[key];
+    if (isObjectLike(xForwardedFor) && options === undefined) {
+      for (const key of Object.keys(xForwardedFor)) merged[key] = xForwardedFor[key];
+    }
+    return merged;
+  }
+  const merged = Object.create(null);
+  merged.socketIp = socketIp;
+  if (isObjectLike(xForwardedFor) && typeof xForwardedFor !== 'string' && !Array.isArray(xForwardedFor)) {
+    for (const key of Object.keys(xForwardedFor)) merged[key] = xForwardedFor[key];
+  } else {
+    merged.xForwardedFor = xForwardedFor;
+  }
+  if (options !== undefined) {
+    if (!isObjectLike(options) || Array.isArray(options)) invalidInput('extractClientIp options must be an object');
+    for (const key of Object.keys(options)) merged[key] = options[key];
+  }
+  return merged;
+}
+
+export function extractClientIp(socketIp, xForwardedFor, options) {
+  const raw = normalizeExtractArguments(socketIp, xForwardedFor, options);
+  const opts = copyOwnOptions(raw, [
+    'socketIp',
+    'xForwardedFor',
+    'forwarded',
+    'trustedProxies',
+    'maxForwardedHops',
+    'maxForwardedHeaderBytes',
+    'ipv6Prefix'
+  ], 'extractClientIp options');
+  if (typeof opts.socketIp !== 'string') invalidInput('socketIp must be a string');
+  const socketParsed = parseIpOrThrow(opts.socketIp);
+  const trusted = prepareTrustedProxies(opts.trustedProxies);
+  const maxHops = integerValue(opts.maxForwardedHops, DEFAULTS.maxForwardedHops, 1, MAX_FORWARDED_HOPS_LIMIT, 'maxForwardedHops');
+  const maxBytes = integerValue(opts.maxForwardedHeaderBytes, DEFAULTS.maxForwardedHeaderBytes, 64, MAX_FORWARDED_BYTES_LIMIT, 'maxForwardedHeaderBytes');
+  const ipv6Prefix = readIpv6Prefix(opts.ipv6Prefix, DEFAULTS.ipv6Prefix, 'ipv6Prefix');
+  const finish = (parsed) => parsed.family === 4 ? parsed.canonical : bucketIpv6Parsed(parsed, ipv6Prefix);
+  const socketResult = finish(socketParsed);
+  if (trusted.length === 0) return socketResult;
+  const socketTrusted = trusted.some((cidr) => ipParsedInCidr(socketParsed, cidr));
+  if (!socketTrusted) return socketResult;
+
+  let tokens = null;
+  if (typeof opts.xForwardedFor === 'string') {
+    tokens = parseXForwardedFor(opts.xForwardedFor, maxBytes);
+  } else {
+    tokens = parseForwarded(opts.forwarded, maxBytes);
+  }
+  if (tokens === null || tokens.length === 0) return socketResult;
+  if (tokens.length > maxHops) tokens = tokens.slice(-maxHops);
+
+  let selected = null;
+  for (let index = tokens.length - 1; index >= 0; index -= 1) {
+    const candidate = tokens[index];
+    if (ipParsedInAnyCidr(candidate, trusted)) continue;
+    selected = candidate;
+    break;
+  }
+  if (selected === null) selected = tokens[0];
+  return finish(selected);
+}
+
+function ipParsedInAnyCidr(parsedIp, cidrs) {
+  for (const cidr of cidrs) {
+    if (ipParsedInCidr(parsedIp, cidr)) return true;
+  }
+  return false;
+}
+
+function cloneStoreValue(value) {
+  if (Array.isArray(value)) return value.slice();
+  if (isObjectLike(value)) return { ...value };
+  return value;
+}
+
+function validateStoreKey(key, maxKeyLength) {
+  if (typeof key !== 'string' || key.length === 0) invalidKey('rate store key must be a non-empty string');
+  if (hasControlChars(key)) invalidKey('rate store key must not contain NUL or control characters');
+  if (byteLength(key) > maxKeyLength) {
+    fail(CODE.INVALID_KEY, 'rate store key exceeds maxKeyLength', { limit: maxKeyLength, actual: byteLength(key) });
+  }
+}
+
+function validateTtl(ttlMs) {
+  if (typeof ttlMs !== 'number' || !Number.isFinite(ttlMs) || ttlMs <= 0 || ttlMs > MAX_STORE_TTL_MS) {
+    invalidInput('store ttlMs must be a positive finite number within the supported range');
+  }
+  return Math.ceil(ttlMs);
+}
+
+export class MemoryRateStore {
+  constructor(options) {
+    const opts = copyOwnOptions(options, ['maxKeys', 'maxKeyLength', 'now', 'pruneScanLimit'], 'MemoryRateStore options');
+    this.maxKeys = integerValue(opts.maxKeys, DEFAULTS.maxKeys, 1, MAX_KEYS_LIMIT, 'maxKeys');
+    this.maxKeyLength = integerValue(opts.maxKeyLength, DEFAULTS.maxKeyLength, 32, MAX_STORE_KEY_LENGTH, 'maxKeyLength');
+    this.pruneScanLimit = integerValue(opts.pruneScanLimit, 32, 1, 256, 'pruneScanLimit');
+    this.now = functionValue(opts.now, () => Date.now(), 'now');
+    this.lastNowMs = null;
+    this.entries = new Map();
+  }
+
+  get size() {
+    this.pruneExpiredOpportunistic();
+    return this.entries.size;
+  }
+
+  nowMs() {
+    const value = this.now();
+    if (typeof value !== 'number' || !Number.isFinite(value)) invalidInput('store clock must return a finite number of milliseconds');
+    if (this.lastNowMs === null || value > this.lastNowMs) this.lastNowMs = value;
+    return this.lastNowMs;
+  }
+
+  validateKey(key) {
+    validateStoreKey(key, this.maxKeyLength);
+  }
+
+  touch(key, record) {
+    this.entries.delete(key);
+    this.entries.set(key, record);
+  }
+
+  isExpired(record, now) {
+    return record.expiresAtMs <= now;
+  }
+
+  pruneExpiredOpportunistic() {
+    const now = this.nowMs();
+    let scanned = 0;
+    let removed = 0;
+    for (const [key, record] of this.entries) {
+      if (scanned >= this.pruneScanLimit) break;
+      scanned += 1;
+      if (this.isExpired(record, now)) {
+        this.entries.delete(key);
+        removed += 1;
+      }
+    }
+    return removed;
+  }
+
+  pruneExpired() {
+    const now = this.nowMs();
+    let removed = 0;
+    for (const [key, record] of this.entries) {
+      if (this.isExpired(record, now)) {
+        this.entries.delete(key);
+        removed += 1;
+      }
+    }
+    return removed;
+  }
+
+  evictOverflow() {
+    let evicted = 0;
+    while (this.entries.size > this.maxKeys) {
+      const oldest = this.entries.keys().next();
+      if (oldest.done) break;
+      this.entries.delete(oldest.value);
+      evicted += 1;
+    }
+    return evicted;
+  }
+
+  get(key) {
+    this.validateKey(key);
+    this.pruneExpiredOpportunistic();
+    const record = this.entries.get(key);
+    if (record === undefined) return undefined;
+    const now = this.nowMs();
+    if (this.isExpired(record, now)) {
+      this.entries.delete(key);
+      return undefined;
+    }
+    this.touch(key, record);
+    return cloneStoreValue(record.value);
+  }
+
+  set(key, value, ttlMs) {
+    this.validateKey(key);
+    const ttl = validateTtl(ttlMs);
+    if (value === undefined) invalidInput('store value must not be undefined');
+    this.pruneExpiredOpportunistic();
+    const now = this.nowMs();
+    this.entries.delete(key);
+    this.entries.set(key, {
+      value: cloneStoreValue(value),
+      expiresAtMs: now + ttl
+    });
+    this.evictOverflow();
+    return cloneStoreValue(value);
+  }
+
+  update(key, updater, ttlMs) {
+    this.validateKey(key);
+    if (typeof updater !== 'function') invalidInput('store updater must be a function');
+    const current = this.get(key);
+    const updated = updater(cloneStoreValue(current), this.nowMs());
+    if (updated === undefined) {
+      this.entries.delete(key);
+      return undefined;
+    }
+    this.set(key, updated, ttlMs);
+    return cloneStoreValue(updated);
+  }
+
+  delete(key) {
+    this.validateKey(key);
+    return this.entries.delete(key);
+  }
+
+  clear() {
+    this.entries.clear();
+  }
+}
+
+function validateNamespace(value) {
+  if (value === undefined) return DEFAULTS.namespace;
+  if (typeof value !== 'string' || !NAMESPACE_RE.test(value) || value.length > MAX_NAMESPACE_LENGTH) {
+    invalidOptions('namespace must be 1 to 32 ASCII letters, digits, dot, underscore or hyphen characters', 'namespace');
+  }
+  return value;
+}
+
+function validateUserKey(key) {
+  if (typeof key !== 'string' || key.length === 0) invalidKey('rate limit key must be a non-empty string');
+  if (hasControlChars(key)) invalidKey('rate limit key must not contain NUL or control characters');
+  if (byteLength(key) > MAX_RAW_KEY_BYTES) {
+    fail(CODE.INVALID_KEY, 'rate limit key exceeds the maximum raw key size', { limit: MAX_RAW_KEY_BYTES, actual: byteLength(key) });
+  }
+}
+
+export function createRateLimitKey(namespace, key, maxKeyLength = DEFAULTS.maxKeyLength) {
+  const validNamespace = validateNamespace(namespace);
+  validateUserKey(key);
+  if (typeof maxKeyLength !== 'number' || !Number.isSafeInteger(maxKeyLength) || maxKeyLength < 32 || maxKeyLength > MAX_STORE_KEY_LENGTH) {
+    invalidInput('maxKeyLength must be a safe integer in range');
+  }
+  const directBytes = byteLength(validNamespace) + 1 + byteLength(key);
+  if (directBytes <= maxKeyLength) return validNamespace + ':' + key;
+  const digest = crypto.createHash('sha256').update(key, 'utf8').digest('hex');
+  const hashed = validNamespace + ':sha256:' + digest;
+  if (byteLength(hashed) > maxKeyLength) {
+    invalidKey('maxKeyLength is too small for a collision-resistant namespaced key');
+  }
+  return hashed;
+}
+
+function validateStore(store) {
+  if (!isObjectLike(store)) invalidOptions('store must implement the RateStore interface', 'store');
+  if (typeof store.get !== 'function' || typeof store.set !== 'function') {
+    invalidOptions('store must provide get and set functions', 'store');
+  }
+  if (store.update !== undefined && typeof store.update !== 'function') {
+    invalidOptions('store update must be a function when present', 'store');
+  }
+  return store;
+}
+
+function validateCost(value, fallback, field) {
+  if (value === undefined) return fallback;
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 1 || value > MAX_COST) {
+    fail(CODE.INVALID_COST, field + ' must be a positive safe integer within the supported cost bound', { field, limit: MAX_COST });
+  }
+  return value;
+}
+
+function cloneStateObject(value) {
+  if (!isObjectLike(value) || Array.isArray(value)) return undefined;
+  return { ...value };
+}
+
+function requireFiniteNumber(value, field) {
+  if (typeof value !== 'number' || !Number.isFinite(value)) fail(CODE.INVALID_STATE, 'stored rate state is corrupt', { field });
+  return value;
+}
+
+function validateFixedState(value) {
+  if (value === undefined) return undefined;
+  const state = cloneStateObject(value);
+  if (state === undefined || state.v !== 1) fail(CODE.INVALID_STATE, 'stored fixed-window state is corrupt');
+  requireFiniteNumber(state.w, 'w');
+  requireFiniteNumber(state.c, 'c');
+  if (state.c < 0) fail(CODE.INVALID_STATE, 'stored fixed-window count is corrupt');
+  return state;
+}
+
+function validateSlidingState(value) {
+  if (value === undefined) return undefined;
+  const state = cloneStateObject(value);
+  if (state === undefined || state.v !== 1) fail(CODE.INVALID_STATE, 'stored sliding-window state is corrupt');
+  requireFiniteNumber(state.w, 'w');
+  requireFiniteNumber(state.p, 'p');
+  requireFiniteNumber(state.c, 'c');
+  if (state.p < 0 || state.c < 0) fail(CODE.INVALID_STATE, 'stored sliding-window counts are corrupt');
+  return state;
+}
+
+function validateBucketState(value) {
+  if (value === undefined) return undefined;
+  const state = cloneStateObject(value);
+  if (state === undefined || state.v !== 1) fail(CODE.INVALID_STATE, 'stored token-bucket state is corrupt');
+  requireFiniteNumber(state.t, 't');
+  requireFiniteNumber(state.u, 'u');
+  if (state.t < 0) fail(CODE.INVALID_STATE, 'stored token count is corrupt');
+  return state;
+}
+
+function alignedWindowStart(now, windowMs) {
+  return Math.floor(now / windowMs) * windowMs;
+}
+
+function rotateSlidingState(state, now, windowMs) {
+  if (state === undefined) {
+    return { v: 1, w: alignedWindowStart(now, windowMs), p: 0, c: 0 };
+  }
+  if (now < state.w) return { ...state };
+  const elapsed = now - state.w;
+  if (elapsed < windowMs) return { ...state };
+  if (elapsed < windowMs * 2) {
+    return { v: 1, w: state.w + windowMs, p: state.c, c: 0 };
+  }
+  return { v: 1, w: alignedWindowStart(now, windowMs), p: 0, c: 0 };
+}
+
+function slidingEffectiveCount(state, now, windowMs) {
+  const progress = Math.min(1, Math.max(0, (now - state.w) / windowMs));
+  return state.p * (1 - progress) + state.c;
+}
+
+function projectSlidingCount(state, at, windowMs) {
+  const rotated = rotateSlidingState(state, at, windowMs);
+  return slidingEffectiveCount(rotated, at, windowMs);
+}
+
+function slidingRetryMs(state, now, windowMs, limit, cost) {
+  if (cost > limit) return 1;
+  let low = 0;
+  let high = windowMs * 2 + 1;
+  for (let iteration = 0; iteration < 56; iteration += 1) {
+    const middle = (low + high) / 2;
+    const projected = projectSlidingCount(state, now + middle, windowMs);
+    if (projected + cost <= limit + EPSILON) high = middle;
+    else low = middle;
+  }
+  return Math.max(1, Math.ceil(high));
+}
+
+function computeFixedWindow(current, now, config, cost, consume) {
+  let state = validateFixedState(current);
+  if (state === undefined || now >= state.w + config.windowMs) {
+    state = { v: 1, w: alignedWindowStart(now, config.windowMs), c: 0 };
+  }
+  const costExceeded = cost > config.limit;
+  const allowed = !costExceeded && state.c + cost <= config.limit;
+  if (allowed && consume) state.c += cost;
+  const resetAtMs = state.w + config.windowMs;
+  return {
+    state,
+    allowed,
+    reason: costExceeded ? 'cost-exceeds-limit' : (allowed ? 'ok' : 'rate-limited'),
+    remaining: allowed ? Math.max(0, config.limit - state.c) : 0,
+    resetAtMs,
+    retryAfterMs: allowed ? 0 : Math.max(1, Math.ceil(resetAtMs - now))
+  };
+}
+
+function computeSlidingWindow(current, now, config, cost, consume) {
+  const validated = validateSlidingState(current);
+  const state = rotateSlidingState(validated, now, config.windowMs);
+  const effectiveBefore = slidingEffectiveCount(state, now, config.windowMs);
+  const costExceeded = cost > config.limit;
+  const allowed = !costExceeded && effectiveBefore + cost <= config.limit + EPSILON;
+  if (allowed && consume) state.c += cost;
+  const effectiveAfter = slidingEffectiveCount(state, now, config.windowMs);
+  return {
+    state,
+    allowed,
+    reason: costExceeded ? 'cost-exceeds-limit' : (allowed ? 'ok' : 'rate-limited'),
+    remaining: allowed ? Math.max(0, Math.floor(config.limit - effectiveAfter)) : 0,
+    resetAtMs: state.w + config.windowMs,
+    retryAfterMs: allowed ? 0 : slidingRetryMs(state, now, config.windowMs, config.limit, cost)
+  };
+}
+
+function computeTokenBucket(current, now, config, cost, consume) {
+  let state = validateBucketState(current);
+  if (state === undefined) state = { v: 1, t: config.capacity, u: now };
+  const elapsed = Math.max(0, now - state.u);
+  const refill = elapsed * config.refillPerSecond / 1000;
+  let tokens = Math.min(config.capacity, state.t + refill);
+  if (config.capacity - tokens < EPSILON) tokens = config.capacity;
+  const costExceeded = cost > config.capacity;
+  const allowed = !costExceeded && tokens + EPSILON >= cost;
+  if (allowed && consume) tokens = Math.max(0, tokens - cost);
+  const updatedState = { v: 1, t: tokens, u: Math.max(now, state.u) };
+  const retryAfterMs = allowed || costExceeded ? (costExceeded ? 1 : 0) :
+    Math.max(1, Math.ceil(((cost - tokens) / config.refillPerSecond) * 1000));
+  const missing = Math.max(0, config.capacity - tokens);
+  const resetAtMs = missing === 0 ? now : now + Math.ceil((missing / config.refillPerSecond) * 1000);
+  return {
+    state: updatedState,
+    allowed,
+    reason: costExceeded ? 'cost-exceeds-limit' : (allowed ? 'ok' : 'rate-limited'),
+    remaining: Math.max(0, Math.floor(tokens)),
+    resetAtMs,
+    retryAfterMs
+  };
+}
+
+function computeRateState(current, now, config, cost, consume) {
+  if (config.algorithm === 'fixed-window') return computeFixedWindow(current, now, config, cost, consume);
+  if (config.algorithm === 'token-bucket') return computeTokenBucket(current, now, config, cost, consume);
+  return computeSlidingWindow(current, now, config, cost, consume);
+}
+
+function policyWindowSeconds(config) {
+  if (config.algorithm === 'token-bucket') {
+    return Math.max(1, Math.ceil(config.capacity / config.refillPerSecond));
+  }
+  return Math.max(1, Math.ceil(config.windowMs / 1000));
+}
+
+function buildRateHeaders(resultParts, config) {
+  const headers = Object.create(null);
+  if (!config.includeHeaders) return Object.freeze(headers);
+  const windowSeconds = policyWindowSeconds(config);
+  headers['RateLimit-Policy'] = String(resultParts.limit) + ';w=' + String(windowSeconds);
+  headers.RateLimit = 'limit=' + String(resultParts.limit) + ', remaining=' + String(resultParts.remaining) + ', reset=' + String(resultParts.resetSeconds);
+  if (config.legacyHeaders) {
+    headers['X-RateLimit-Limit'] = String(resultParts.limit);
+    headers['X-RateLimit-Remaining'] = String(resultParts.remaining);
+    headers['X-RateLimit-Reset'] = String(Math.ceil(resultParts.resetAtMs / 1000));
+  }
+  if (!resultParts.allowed) headers['Retry-After'] = String(resultParts.retryAfterSeconds);
+  return Object.freeze(headers);
+}
+
+function freezeRateResult(parts, config) {
+  const base = {
+    allowed: parts.allowed,
+    limit: parts.limit,
+    remaining: Math.max(0, Math.floor(parts.remaining)),
+    resetSeconds: Math.max(0, Math.ceil(parts.resetSeconds)),
+    resetAtMs: Math.ceil(parts.resetAtMs),
+    retryAfterSeconds: parts.allowed ? 0 : Math.max(1, Math.ceil(parts.retryAfterSeconds)),
+    key: parts.key,
+    reason: parts.reason,
+    code: parts.code
+  };
+  base.resetSeconds = Math.max(0, Math.ceil((base.resetAtMs - parts.now) / 1000));
+  const headers = buildRateHeaders({
+    allowed: base.allowed,
+    limit: base.limit,
+    remaining: base.remaining,
+    resetSeconds: base.resetSeconds,
+    resetAtMs: base.resetAtMs,
+    retryAfterSeconds: base.retryAfterSeconds
+  }, config);
+  base.headers = headers;
+  return Object.freeze(base);
+}
+
+function resultCodeFor(reason) {
+  if (reason === 'ok') return RESULT_CODE.OK;
+  if (reason === 'cost-exceeds-limit') return RESULT_CODE.COST_EXCEEDS_LIMIT;
+  if (reason === 'store-error') return RESULT_CODE.STORE_ERROR;
+  return RESULT_CODE.RATE_LIMITED;
+}
+
+function validateNowValue(value) {
+  if (typeof value !== 'number' || !Number.isFinite(value)) invalidInput('now clock must return a finite number of milliseconds');
+  return value;
+}
+
+function validateRateOptions(options) {
+  const keys = [
+    'algorithm',
+    'limit',
+    'windowMs',
+    'capacity',
+    'refillPerSecond',
+    'cost',
+    'namespace',
+    'store',
+    'now',
+    'onStoreError',
+    'legacyHeaders',
+    'includeHeaders',
+    'maxKeyLength'
+  ];
+  const opts = copyOwnOptions(options, keys, 'rate limiter options');
+  const algorithm = opts.algorithm === undefined ? DEFAULTS.algorithm : opts.algorithm;
+  if (algorithm !== 'sliding-window' && algorithm !== 'fixed-window' && algorithm !== 'token-bucket') {
+    invalidOptions('algorithm must be sliding-window, fixed-window or token-bucket', 'algorithm');
+  }
+  const limit = integerValue(opts.limit, DEFAULTS.limit, 1, MAX_LIMIT, 'limit');
+  const windowMs = integerValue(opts.windowMs, DEFAULTS.windowMs, 1, MAX_WINDOW_MS, 'windowMs');
+  const capacity = integerValue(opts.capacity, limit, 1, MAX_LIMIT, 'capacity');
+  const defaultRefill = capacity / (windowMs / 1000);
+  const refillPerSecond = finiteNumberValue(opts.refillPerSecond, defaultRefill, 0.000001, 1000000, 'refillPerSecond');
+  const cost = validateCost(opts.cost, DEFAULTS.cost, 'cost');
+  const namespace = validateNamespace(opts.namespace);
+  const now = functionValue(opts.now, () => Date.now(), 'now');
+  const onStoreError = opts.onStoreError === undefined ? DEFAULTS.onStoreError : opts.onStoreError;
+  if (onStoreError !== 'deny' && onStoreError !== 'allow') {
+    invalidOptions('onStoreError must be deny or allow', 'onStoreError');
+  }
+  const legacyHeaders = booleanValue(opts.legacyHeaders, true, 'legacyHeaders');
+  const includeHeaders = booleanValue(opts.includeHeaders, true, 'includeHeaders');
+  const maxKeyLength = integerValue(opts.maxKeyLength, DEFAULTS.maxKeyLength, 104, MAX_STORE_KEY_LENGTH, 'maxKeyLength');
+  const store = opts.store === undefined ? new MemoryRateStore({ now }) : validateStore(opts.store);
+  const config = Object.create(null);
+  config.algorithm = algorithm;
+  config.limit = algorithm === 'token-bucket' ? capacity : limit;
+  config.reportedLimit = algorithm === 'token-bucket' ? capacity : limit;
+  config.windowMs = windowMs;
+  config.capacity = capacity;
+  config.refillPerSecond = refillPerSecond;
+  config.cost = cost;
+  config.namespace = namespace;
+  config.store = store;
+  config.now = now;
+  config.onStoreError = onStoreError;
+  config.legacyHeaders = legacyHeaders;
+  config.includeHeaders = includeHeaders;
+  config.maxKeyLength = maxKeyLength;
+  return Object.freeze(config);
+}
+
+function ttlForConfig(config) {
+  if (config.algorithm === 'token-bucket') {
+    const refillMs = Math.ceil((config.capacity / config.refillPerSecond) * 1000);
+    return Math.min(MAX_STORE_TTL_MS, Math.max(1000, refillMs * 2));
+  }
+  return Math.min(MAX_STORE_TTL_MS, config.windowMs * 2 + 1000);
+}
+
+export function createRateLimiter(options) {
+  const config = validateRateOptions(options);
+  const queues = new Map();
+
+  function enqueue(key, task) {
+    const previous = queues.get(key) || Promise.resolve();
+    const run = previous.catch(() => undefined).then(task);
+    queues.set(key, run);
+    const cleanup = run.finally(() => {
+      if (queues.get(key) === run) queues.delete(key);
+    });
+    cleanup.catch(() => undefined);
+    return run;
+  }
+
+  async function readAndCompute(storageKey, cost, consume) {
+    const now = validateNowValue(config.now());
+    let computed;
+    const compute = (current) => {
+      computed = computeRateState(current, now, config, cost, consume);
+      return computed.state;
+    };
+    if (consume) {
+      if (typeof config.store.update === 'function') {
+        await config.store.update(storageKey, compute, ttlForConfig(config));
+      } else {
+        const current = await config.store.get(storageKey);
+        const nextState = compute(current);
+        await config.store.set(storageKey, nextState, ttlForConfig(config));
+      }
+    } else {
+      const current = await config.store.get(storageKey);
+      compute(current);
+    }
+    if (computed === undefined) fail(CODE.STORE_ERROR, 'rate store did not run the state updater');
+    return { computed, now };
+  }
+
+  async function evaluate(key, evaluateOptions) {
+    const requestOptions = copyOwnOptions(evaluateOptions, ['cost'], 'rate limit request options');
+    validateUserKey(key);
+    const cost = validateCost(requestOptions.cost, config.cost, 'cost');
+    const storageKey = createRateLimitKey(config.namespace, key, config.maxKeyLength);
+    const run = typeof config.store.update === 'function' ? (task) => task() : (task) => enqueue(storageKey, task);
+    return run(async () => {
+      try {
+        const { computed, now } = await readAndCompute(storageKey, cost, true);
+        return freezeRateResult({
+          allowed: computed.allowed,
+          limit: config.reportedLimit,
+          remaining: computed.remaining,
+          resetAtMs: computed.resetAtMs,
+          retryAfterSeconds: computed.retryAfterMs / 1000,
+          key: storageKey,
+          reason: computed.reason,
+          code: resultCodeFor(computed.reason),
+          now
+        }, config);
+      } catch (error) {
+        const now = validateNowValue(config.now());
+        const allowed = config.onStoreError === 'allow';
+        const resetAtMs = now + Math.min(config.windowMs, 3600000);
+        return freezeRateResult({
+          allowed,
+          limit: config.reportedLimit,
+          remaining: allowed ? Math.max(0, config.reportedLimit - cost) : 0,
+          resetAtMs,
+          retryAfterSeconds: Math.max(1, Math.ceil(Math.min(config.windowMs, 3600000) / 1000)),
+          key: storageKey,
+          reason: 'store-error',
+          code: RESULT_CODE.STORE_ERROR,
+          now
+        }, config);
+      }
+    });
+  }
+
+  async function peek(key, evaluateOptions) {
+    const requestOptions = copyOwnOptions(evaluateOptions, ['cost'], 'rate limit request options');
+    validateUserKey(key);
+    const cost = validateCost(requestOptions.cost, config.cost, 'cost');
+    const storageKey = createRateLimitKey(config.namespace, key, config.maxKeyLength);
+    const run = typeof config.store.update === 'function' ? (task) => task() : (task) => enqueue(storageKey, task);
+    return run(async () => {
+      try {
+        const { computed, now } = await readAndCompute(storageKey, cost, false);
+        return freezeRateResult({
+          allowed: computed.allowed,
+          limit: config.reportedLimit,
+          remaining: computed.remaining,
+          resetAtMs: computed.resetAtMs,
+          retryAfterSeconds: computed.retryAfterMs / 1000,
+          key: storageKey,
+          reason: computed.reason,
+          code: resultCodeFor(computed.reason),
+          now
+        }, config);
+      } catch (error) {
+        const now = validateNowValue(config.now());
+        const allowed = config.onStoreError === 'allow';
+        const resetAtMs = now + Math.min(config.windowMs, 3600000);
+        return freezeRateResult({
+          allowed,
+          limit: config.reportedLimit,
+          remaining: allowed ? Math.max(0, config.reportedLimit - cost) : 0,
+          resetAtMs,
+          retryAfterSeconds: Math.max(1, Math.ceil(Math.min(config.windowMs, 3600000) / 1000)),
+          key: storageKey,
+          reason: 'store-error',
+          code: RESULT_CODE.STORE_ERROR,
+          now
+        }, config);
+      }
+    });
+  }
+
+  const consume = evaluate;
+  const api = Object.create(null);
+  api.consume = consume;
+  api.check = consume;
+  api.peek = peek;
+  api.config = config;
+  return Object.freeze(api);
+}
+
+const RATE_OPTION_KEYS = Object.freeze([
+  'algorithm',
+  'limit',
+  'windowMs',
+  'capacity',
+  'refillPerSecond',
+  'cost',
+  'namespace',
+  'store',
+  'now',
+  'onStoreError',
+  'legacyHeaders',
+  'includeHeaders',
+  'maxKeyLength'
+]);
+
+function pickRateOptions(source) {
+  const output = Object.create(null);
+  for (const key of RATE_OPTION_KEYS) {
+    if (Object.hasOwn(source, key)) output[key] = source[key];
+  }
+  return output;
+}
+
+function validateLimiterInstance(value) {
+  if (!isObjectLike(value) || typeof value.consume !== 'function' || typeof value.peek !== 'function') {
+    invalidOptions('limiter must be created by createRateLimiter', 'limiter');
+  }
+  return value;
+}
+
+function validateKeyPrefix(value) {
+  if (value === undefined) return 'ip';
+  if (typeof value !== 'string' || value.length === 0 || byteLength(value) > 64 || hasControlChars(value)) {
+    invalidOptions('keyPrefix must be a non-empty string of at most 64 bytes without control characters', 'keyPrefix');
+  }
+  return value;
+}
+
+function validateMessage(value) {
+  if (value === undefined) return 'Too many requests';
+  if (typeof value !== 'string' || value.length === 0 || byteLength(value) > 200 || hasControlChars(value)) {
+    invalidOptions('message must be a short string without control characters', 'message');
+  }
+  return value;
+}
+
+function readNodeHeader(headers, name) {
+  if (!isObjectLike(headers)) return undefined;
+  const value = headers[name];
+  if (value === undefined) return undefined;
+  if (typeof value !== 'string') return '';
+  return value;
+}
+
+function nodeHeadersSent(res) {
+  return Boolean(res && (res.headersSent || res._headerSent));
+}
+
+function writeNodeHeaders(res, headers) {
+  if (!isObjectLike(res) || typeof res.setHeader !== 'function' || nodeHeadersSent(res)) return;
+  for (const [name, value] of Object.entries(headers)) {
+    res.setHeader(name, value);
+  }
+}
+
+function deniedBody(result, message) {
+  return JSON.stringify({
+    error: 'rate_limited',
+    message,
+    retryAfterSeconds: result.retryAfterSeconds
+  });
+}
+
+function finishNodeDenied(req, res, result, message, onDenied) {
+  if (typeof onDenied === 'function') {
+    if (!nodeHeadersSent(res)) writeNodeHeaders(res, result.headers);
+    onDenied(req, res, result);
+    return false;
+  }
+  if (!isObjectLike(res)) return false;
+  if (!nodeHeadersSent(res)) {
+    writeNodeHeaders(res, result.headers);
+    const body = deniedBody(result, message);
+    if (typeof res.setHeader === 'function') {
+      res.setHeader('Cache-Control', 'no-store');
+      res.setHeader('Content-Type', 'application/json; charset=utf-8');
+      res.setHeader('Content-Length', String(byteLength(body)));
+    }
+    res.statusCode = 429;
+    if (typeof res.end === 'function') res.end(body);
+    return false;
+  }
+  if (res.writableEnded !== true && typeof res.end === 'function') res.end();
+  return false;
+}
+
+function extractionSettings(opts) {
+  const output = Object.create(null);
+  output.trustedProxies = opts.compiledTrustedProxies;
+  output.maxForwardedHops = opts.maxForwardedHops;
+  output.maxForwardedHeaderBytes = opts.maxForwardedHeaderBytes;
+  output.ipv6Prefix = opts.ipv6Prefix;
+  return output;
+}
+
+export function createNodeRateLimitMiddleware(options) {
+  const keys = RATE_OPTION_KEYS.concat([
+    'limiter',
+    'trustedProxies',
+    'maxForwardedHops',
+    'maxForwardedHeaderBytes',
+    'ipv6Prefix',
+    'keyPrefix',
+    'message',
+    'skip',
+    'onDenied',
+    'socketIp'
+  ]);
+  const opts = copyOwnOptions(options, keys, 'Node middleware options');
+  const limiter = opts.limiter === undefined ? createRateLimiter(pickRateOptions(opts)) : validateLimiterInstance(opts.limiter);
+  const compiledTrustedProxies = prepareTrustedProxies(opts.trustedProxies);
+  const maxForwardedHops = integerValue(opts.maxForwardedHops, DEFAULTS.maxForwardedHops, 1, MAX_FORWARDED_HOPS_LIMIT, 'maxForwardedHops');
+  const maxForwardedHeaderBytes = integerValue(opts.maxForwardedHeaderBytes, DEFAULTS.maxForwardedHeaderBytes, 64, MAX_FORWARDED_BYTES_LIMIT, 'maxForwardedHeaderBytes');
+  const ipv6Prefix = readIpv6Prefix(opts.ipv6Prefix, DEFAULTS.ipv6Prefix, 'ipv6Prefix');
+  const keyPrefix = validateKeyPrefix(opts.keyPrefix);
+  const message = validateMessage(opts.message);
+  const skip = functionValue(opts.skip, undefined, 'skip');
+  const onDenied = functionValue(opts.onDenied, undefined, 'onDenied');
+  const socketIpOption = opts.socketIp;
+  if (socketIpOption !== undefined && typeof socketIpOption !== 'string' && typeof socketIpOption !== 'function') {
+    invalidOptions('socketIp must be a string or a function', 'socketIp');
+  }
+  if (typeof socketIpOption === 'string') parseIpOrThrow(socketIpOption);
+  const extraction = Object.create(null);
+  extraction.compiledTrustedProxies = compiledTrustedProxies;
+  extraction.maxForwardedHops = maxForwardedHops;
+  extraction.maxForwardedHeaderBytes = maxForwardedHeaderBytes;
+  extraction.ipv6Prefix = ipv6Prefix;
+
+  return async function rateCageMiddleware(req, res, next) {
+    if (skip !== undefined && skip(req) === true) {
+      if (typeof next === 'function') next();
+      return true;
+    }
+    const headers = isObjectLike(req) ? req.headers : undefined;
+    let socketIp = typeof socketIpOption === 'function' ? socketIpOption(req) : socketIpOption;
+    if (socketIp === undefined && isObjectLike(req)) {
+      if (isObjectLike(req.socket) && typeof req.socket.remoteAddress === 'string') socketIp = req.socket.remoteAddress;
+      else if (isObjectLike(req.connection) && typeof req.connection.remoteAddress === 'string') socketIp = req.connection.remoteAddress;
+    }
+    let clientIp = 'unidentified';
+    if (typeof socketIp === 'string') {
+      try {
+        clientIp = extractClientIp(Object.assign(extractionSettings(extraction), {
+          socketIp,
+          xForwardedFor: readNodeHeader(headers, 'x-forwarded-for'),
+          forwarded: readNodeHeader(headers, 'forwarded')
+        }));
+      } catch (error) {
+        clientIp = 'unidentified';
+      }
+    }
+    const result = await limiter.consume(keyPrefix + ':' + clientIp);
+    if (result.allowed) {
+      writeNodeHeaders(res, result.headers);
+      if (typeof next === 'function') next();
+      return true;
+    }
+    return finishNodeDenied(req, res, result, message, onDenied);
+  };
+}
+
+function requireFetchRuntime() {
+  if (typeof Response !== 'function' || typeof Headers !== 'function') {
+    invalidInput('the Fetch Response and Headers constructors are required');
+  }
+}
+
+function readFetchHeader(request, name) {
+  if (!isObjectLike(request) || !isObjectLike(request.headers) || typeof request.headers.get !== 'function') return undefined;
+  const value = request.headers.get(name);
+  return typeof value === 'string' ? value : undefined;
+}
+
+function makeDeniedResponse(result, message) {
+  requireFetchRuntime();
+  const body = deniedBody(result, message);
+  const headers = new Headers();
+  for (const [name, value] of Object.entries(result.headers)) headers.set(name, value);
+  headers.set('Cache-Control', 'no-store');
+  headers.set('Content-Type', 'application/json; charset=utf-8');
+  return new Response(body, {
+    status: 429,
+    statusText: 'Too Many Requests',
+    headers
+  });
+}
+
+function isResponseLike(value) {
+  return isObjectLike(value) && typeof value.clone === 'function' && isObjectLike(value.headers) &&
+    typeof value.status === 'number';
+}
+
+function responseWithRateHeaders(response, rateHeaders) {
+  requireFetchRuntime();
+  const clone = response.clone();
+  const headers = new Headers(clone.headers);
+  for (const [name, value] of Object.entries(rateHeaders)) headers.set(name, value);
+  return new Response(clone.body, {
+    status: clone.status,
+    statusText: clone.statusText,
+    headers
+  });
+}
+
+export function createFetchRateLimitHandler(handlerOrOptions, maybeOptions) {
+  let handler;
+  let rawOptions;
+  if (typeof handlerOrOptions === 'function') {
+    handler = handlerOrOptions;
+    rawOptions = maybeOptions;
+  } else {
+    rawOptions = handlerOrOptions;
+    if (isObjectLike(handlerOrOptions) && typeof handlerOrOptions.handler === 'function') handler = handlerOrOptions.handler;
+  }
+  const keys = RATE_OPTION_KEYS.concat([
+    'handler',
+    'limiter',
+    'trustedProxies',
+    'maxForwardedHops',
+    'maxForwardedHeaderBytes',
+    'ipv6Prefix',
+    'keyPrefix',
+    'message',
+    'socketIp',
+    'getSocketIp'
+  ]);
+  const opts = copyOwnOptions(rawOptions, keys, 'Fetch rate limit options');
+  if (handler === undefined && typeof opts.handler === 'function') handler = opts.handler;
+  if (typeof handler !== 'function') invalidOptions('handler must be a Fetch-style function', 'handler');
+  const limiter = opts.limiter === undefined ? createRateLimiter(pickRateOptions(opts)) : validateLimiterInstance(opts.limiter);
+  const compiledTrustedProxies = prepareTrustedProxies(opts.trustedProxies);
+  const maxForwardedHops = integerValue(opts.maxForwardedHops, DEFAULTS.maxForwardedHops, 1, MAX_FORWARDED_HOPS_LIMIT, 'maxForwardedHops');
+  const maxForwardedHeaderBytes = integerValue(opts.maxForwardedHeaderBytes, DEFAULTS.maxForwardedHeaderBytes, 64, MAX_FORWARDED_BYTES_LIMIT, 'maxForwardedHeaderBytes');
+  const ipv6Prefix = readIpv6Prefix(opts.ipv6Prefix, DEFAULTS.ipv6Prefix, 'ipv6Prefix');
+  const keyPrefix = validateKeyPrefix(opts.keyPrefix);
+  const message = validateMessage(opts.message);
+  if (opts.socketIp !== undefined && typeof opts.socketIp !== 'string' && typeof opts.socketIp !== 'function') {
+    invalidOptions('socketIp must be a string or a function', 'socketIp');
+  }
+  if (typeof opts.socketIp === 'string') parseIpOrThrow(opts.socketIp);
+  const getSocketIp = functionValue(opts.getSocketIp, undefined, 'getSocketIp');
+  const extraction = Object.create(null);
+  extraction.compiledTrustedProxies = compiledTrustedProxies;
+  extraction.maxForwardedHops = maxForwardedHops;
+  extraction.maxForwardedHeaderBytes = maxForwardedHeaderBytes;
+  extraction.ipv6Prefix = ipv6Prefix;
+
+  return async function rateCageFetchHandler(request) {
+    requireFetchRuntime();
+    if (!isObjectLike(request)) invalidInput('request must be a Fetch-style Request object');
+    let socketIp = typeof opts.socketIp === 'function' ? opts.socketIp(request) : opts.socketIp;
+    if (socketIp === undefined && getSocketIp !== undefined) socketIp = getSocketIp(request);
+    if (socketIp === undefined) {
+      if (typeof request.socketIp === 'string') socketIp = request.socketIp;
+      else if (typeof request.ip === 'string') socketIp = request.ip;
+      else if (isObjectLike(request.socket) && typeof request.socket.remoteAddress === 'string') socketIp = request.socket.remoteAddress;
+      else socketIp = '0.0.0.0';
+    }
+    let clientIp = 'unidentified';
+    try {
+      clientIp = extractClientIp(Object.assign(extractionSettings(extraction), {
+        socketIp,
+        xForwardedFor: readFetchHeader(request, 'x-forwarded-for'),
+        forwarded: readFetchHeader(request, 'forwarded')
+      }));
+    } catch (error) {
+      clientIp = 'unidentified';
+    }
+    const result = await limiter.consume(keyPrefix + ':' + clientIp);
+    if (!result.allowed) return makeDeniedResponse(result, message);
+    const response = await handler(request);
+    if (!isResponseLike(response)) invalidInput('handler must return a Fetch Response');
+    return responseWithRateHeaders(response, result.headers);
+  };
+}
+
+function freezeFindingList(findings) {
+  return Object.freeze(findings.map((finding) => Object.freeze(finding)));
+}
+
+function lintInputObject(input) {
+  if (typeof input === 'string') {
+    if (byteLength(input) > MAX_CONFIG_BYTES) {
+      return { error: 'configuration JSON is too large' };
+    }
+    try {
+      return { value: JSON.parse(input) };
+    } catch (error) {
+      return { error: 'configuration is not valid JSON' };
+    }
+  }
+  return { value: input };
+}
+
+function ownOrUndefined(object, key) {
+  return Object.hasOwn(object, key) ? object[key] : undefined;
+}
+
+export function lintRateLimitConfig(input) {
+  const parsedInput = lintInputObject(input);
+  const findings = [];
+  const add = (code, severity, path, message, recommendation) => {
+    findings.push({ code, severity, path, message, recommendation });
+  };
+  if (parsedInput.error !== undefined) {
+    add('RATECAGE_INVALID_JSON', 'error', '$', parsedInput.error, 'Provide a valid JSON object.');
+    return freezeFindingList(findings);
+  }
+  const config = parsedInput.value;
+  if (!isObjectLike(config) || Array.isArray(config)) {
+    add('RATECAGE_INVALID_CONFIG', 'error', '$', 'Configuration must be an object.', 'Use a JSON object with rate limiter fields.');
+    return freezeFindingList(findings);
+  }
+
+  const store = isObjectLike(config.store) && !Array.isArray(config.store) ? config.store : undefined;
+  const hasMaxKeys = Object.hasOwn(config, 'maxKeys') || (store !== undefined && Object.hasOwn(store, 'maxKeys'));
+  const maxKeys = Object.hasOwn(config, 'maxKeys') ? config.maxKeys : (store === undefined ? undefined : ownOrUndefined(store, 'maxKeys'));
+  if (!hasMaxKeys) {
+    add(
+      'RATECAGE_MISSING_KEY_CAP',
+      'warning',
+      '$.maxKeys',
+      'No explicit maximum key count is configured.',
+      'Set maxKeys to a positive bounded integer such as 50000.'
+    );
+  } else if (maxKeys === null || maxKeys === false || typeof maxKeys !== 'number' || !Number.isFinite(maxKeys) || maxKeys < 1) {
+    add(
+      'RATECAGE_UNBOUNDED_STORE',
+      'error',
+      '$.maxKeys',
+      'The key store is configured without a real size bound.',
+      'Use a positive finite maxKeys value so rotating IPs cannot exhaust memory.'
+    );
+  } else if (!Number.isSafeInteger(maxKeys) || maxKeys > MAX_KEYS_LIMIT) {
+    add(
+      'RATECAGE_UNBOUNDED_STORE',
+      'error',
+      '$.maxKeys',
+      'The configured key cap is not a practical bounded integer.',
+      'Use an integer no larger than 1000000.'
+    );
+  }
+
+  const trusted = Object.hasOwn(config, 'trustedProxies') ? config.trustedProxies : config.trustProxies;
+  let trustsAll = trusted === true || trusted === '*' || trusted === 'all';
+  if (Array.isArray(trusted)) {
+    for (let index = 0; index < trusted.length; index += 1) {
+      const entry = trusted[index];
+      if (entry === '*' || entry === 'all') {
+        trustsAll = true;
+        continue;
+      }
+      if (typeof entry !== 'string') {
+        add(
+          'RATECAGE_INVALID_TRUSTED_PROXY',
+          'error',
+          '$.trustedProxies[' + index + ']',
+          'A trusted proxy entry is not a string.',
+          'Use exact IPs or strict CIDR ranges only.'
+        );
+        continue;
+      }
+      try {
+        const cidr = parseCidr(entry);
+        if (cidr.prefix === 0) trustsAll = true;
+      } catch (error) {
+        add(
+          'RATECAGE_INVALID_TRUSTED_PROXY',
+          'error',
+          '$.trustedProxies[' + index + ']',
+          'A trusted proxy entry is not a valid strict IP or CIDR.',
+          'Use strict dotted IPv4 or canonical IPv6 CIDR notation.'
+        );
+      }
+    }
+  }
+  else if (trusted !== undefined && trustsAll === false) {
+    add(
+      'RATECAGE_INVALID_TRUSTED_PROXY',
+      'error',
+      '$.trustedProxies',
+      'trustedProxies must be an array of strict IPs or CIDRs.',
+      'Use an array such as ["10.0.0.0/8"] or omit the field.'
+    );
+  }
+  if (trustsAll) {
+    add(
+      'RATECAGE_TRUST_ALL_PROXIES',
+      'error',
+      '$.trustedProxies',
+      'Configuration trusts every proxy, which makes forwarded headers attacker controlled.',
+      'Trust only the exact IPs or CIDRs of reverse proxies you operate.'
+    );
+  }
+
+  if (Object.hasOwn(config, 'ipv6Prefix')) {
+    const prefix = config.ipv6Prefix;
+    if (prefix === false || prefix === null || (typeof prefix === 'number' && prefix >= 128) || prefix === '128') {
+      add(
+        'RATECAGE_IPV6_HOST_BUCKET_BYPASS',
+        'error',
+        '$.ipv6Prefix',
+        'IPv6 host bucketing effectively gives every rotated interface identifier its own bucket.',
+        'Use the default /64 bucketing or another prefix no narrower than the customer network allocation.'
+      );
+    }
+  }
+
+  const failOpen = config.onStoreError === 'allow' || config.failOpen === true ||
+    (store !== undefined && (store.onStoreError === 'allow' || store.failOpen === true));
+  if (failOpen) {
+    add(
+      'RATECAGE_FAIL_OPEN_STORE',
+      'error',
+      '$.onStoreError',
+      'A store outage would allow requests instead of failing closed.',
+      'Use deny unless a documented availability review accepts fail-open behavior.'
+    );
+  }
+
+  const limit = typeof config.limit === 'number' ? config.limit : undefined;
+  const windowMs = typeof config.windowMs === 'number' ? config.windowMs :
+    (typeof config.windowSeconds === 'number' ? config.windowSeconds * 1000 : undefined);
+  if ((typeof limit === 'number' && limit > 100000) || (typeof windowMs === 'number' && windowMs > 3600000)) {
+    add(
+      'RATECAGE_EXCESSIVE_WINDOW_OR_LIMIT',
+      'warning',
+      typeof limit === 'number' && limit > 100000 ? '$.limit' : '$.windowMs',
+      'The configured limit or window is large enough to weaken brute-force protection.',
+      'Prefer smaller windows and limits, then enforce longer-term controls at a second layer.'
+    );
+  }
+
+  return freezeFindingList(findings);
+}
+
+export function createRateCage(options) {
+  const keys = RATE_OPTION_KEYS.concat([
+    'trustedProxies',
+    'maxForwardedHops',
+    'maxForwardedHeaderBytes',
+    'ipv6Prefix',
+    'keyPrefix',
+    'message',
+    'socketIp'
+  ]);
+  const opts = copyOwnOptions(options, keys, 'ratecage options');
+  const limiter = createRateLimiter(pickRateOptions(opts));
+  const adapterOptions = Object.create(null);
+  for (const key of Object.keys(opts)) adapterOptions[key] = opts[key];
+  adapterOptions.limiter = limiter;
+  const middleware = createNodeRateLimitMiddleware(adapterOptions);
+
+  function extract(socketIp, xForwardedFor, overrides) {
+    const merged = Object.create(null);
+    for (const key of ['trustedProxies', 'maxForwardedHops', 'maxForwardedHeaderBytes', 'ipv6Prefix']) {
+      if (Object.hasOwn(opts, key)) merged[key] = opts[key];
+    }
+    if (isObjectLike(xForwardedFor) && typeof xForwardedFor !== 'string' && !Array.isArray(xForwardedFor)) {
+      for (const key of Object.keys(xForwardedFor)) merged[key] = xForwardedFor[key];
+    } else {
+      merged.xForwardedFor = xForwardedFor;
+    }
+    if (overrides !== undefined) {
+      if (!isObjectLike(overrides) || Array.isArray(overrides)) invalidInput('extract overrides must be an object');
+      for (const key of Object.keys(overrides)) merged[key] = overrides[key];
+    }
+    merged.socketIp = socketIp;
+    return extractClientIp(merged);
+  }
+
+  function createFetchHandler(handler, overrides) {
+    const merged = Object.create(null);
+    for (const key of Object.keys(adapterOptions)) merged[key] = adapterOptions[key];
+    if (overrides !== undefined) {
+      if (!isObjectLike(overrides) || Array.isArray(overrides)) invalidInput('Fetch overrides must be an object');
+      for (const key of Object.keys(overrides)) merged[key] = overrides[key];
+    }
+    return createFetchRateLimitHandler(handler, merged);
+  }
+
+  const api = Object.create(null);
+  api.limiter = limiter;
+  api.consume = limiter.consume;
+  api.check = limiter.check;
+  api.peek = limiter.peek;
+  api.middleware = middleware;
+  api.nodeMiddleware = middleware;
+  api.extractClientIp = extract;
+  api.createFetchHandler = createFetchHandler;
+  api.config = limiter.config;
+  return Object.freeze(api);
+}
+
+const ratecage = Object.freeze({
+  CODE,
+  RESULT_CODE,
+  DEFAULTS,
+  RateCageError,
+  normalizeIp,
+  parseCidr,
+  ipInCidr,
+  extractClientIp,
+  MemoryRateStore,
+  createRateLimitKey,
+  createRateLimiter,
+  createRateCage,
+  createNodeRateLimitMiddleware,
+  createFetchRateLimitHandler,
+  lintRateLimitConfig
+});
+
+export default ratecage;
